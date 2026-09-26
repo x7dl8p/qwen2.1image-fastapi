@@ -1,0 +1,47 @@
+import os
+from dataclasses import dataclass, field
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+
+
+def _env(name: str, default: str) -> str:
+    return os.environ.get(name) or default
+
+
+@dataclass(frozen=True)
+class Settings:
+    # ComfyUI engine. If COMFY_URL is set, attach to that server instead of spawning one.
+    comfy_dir: Path = Path(_env("COMFY_DIR", str(ROOT / "ComfyUI")))
+    comfy_url: str = os.environ.get("COMFY_URL", "")
+    comfy_port: int = int(_env("COMFY_PORT", "8189"))
+    comfy_args: str = os.environ.get("COMFY_ARGS", "")
+    comfy_start_timeout: float = float(_env("COMFY_START_TIMEOUT", "300"))
+
+    # API
+    api_key: str = os.environ.get("API_KEY", "")
+    request_timeout: float = float(_env("REQUEST_TIMEOUT", "600"))
+
+    # Model files (names inside ComfyUI/models/<folder>/). Defaults = official int8 workflow.
+    diffusion_model: str = _env("DIFFUSION_MODEL", "qwen_image_2.1_int8_convrot.safetensors")
+    text_encoder: str = _env("TEXT_ENCODER", "qwen3vl_8b_int8_convrot.safetensors")
+    enhancer: str = _env("ENHANCER_MODEL", "qwen3.5_9b_qwen_image_2.1_pe_t2i.int8_convrot.safetensors")
+    vae: str = _env("VAE_MODEL", "qwen_image_2.1_vae_bf16.safetensors")
+
+    log_dir: Path = field(default=ROOT / "logs")
+
+    @property
+    def base_url(self) -> str:
+        return self.comfy_url.rstrip("/") or f"http://127.0.0.1:{self.comfy_port}"
+
+    def model_paths(self) -> dict[str, Path]:
+        models = self.comfy_dir / "models"
+        return {
+            "diffusion_model": models / "diffusion_models" / self.diffusion_model,
+            "text_encoder": models / "text_encoders" / self.text_encoder,
+            "enhancer": models / "text_encoders" / self.enhancer,
+            "vae": models / "vae" / self.vae,
+        }
+
+
+settings = Settings()

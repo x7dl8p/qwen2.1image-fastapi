@@ -21,6 +21,18 @@ class Settings:
     # API
     api_key: str = os.environ.get("API_KEY", "")
     request_timeout: float = float(_env("REQUEST_TIMEOUT", "600"))
+    queue_max: int = int(_env("QUEUE_MAX", "100"))       # max jobs waiting; more -> HTTP 429
+    jobs_keep: int = int(_env("JOBS_KEEP", "1000"))      # finished jobs remembered in memory
+
+    # Storage: Cloudflare R2 (any S3-compatible bucket). Unset -> images saved to ./outputs.
+    r2_access_key_id: str = os.environ.get("R2_ACCESS_KEY_ID", "")
+    r2_secret_access_key: str = os.environ.get("R2_SECRET_ACCESS_KEY", "")
+    r2_bucket: str = os.environ.get("R2_BUCKET_NAME", "")
+    r2_endpoint: str = os.environ.get("R2_ENDPOINT", "")
+    r2_region: str = _env("R2_REGION", "auto")
+    r2_prefix: str = os.environ.get("R2_PREFIX", "")                  # e.g. "qwen/" -> qwen/<id>.png
+    r2_url_expires: int = int(_env("R2_URL_EXPIRES", "604800"))      # signed URL lifetime, max 7 days
+    r2_public_base_url: str = os.environ.get("R2_PUBLIC_BASE_URL", "")  # set if the bucket has a public domain
 
     # Model files (names inside ComfyUI/models/<folder>/). Defaults = official int8 workflow.
     diffusion_model: str = _env("DIFFUSION_MODEL", "qwen_image_2.1_int8_convrot.safetensors")

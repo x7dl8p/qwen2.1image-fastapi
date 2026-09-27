@@ -42,21 +42,23 @@ ssh -i ssh/id_ed25519 -p <PORT> <USER@IP> "cd /workspace/qwen-image-api && scrip
 ```
 It must end with `== models ready`. The script downloads exactly the files in [Models](#models-direct-links-and-where-to-put-them) below. To do it by hand, use the `wget` commands in that section.
 
-**Step 6: start the backend.** On Vast, pick a free published port so the Swagger UI gets a public link. Protect it with an API key.
+**Step 6: start the backend under PM2** (restarts it if it crashes and brings it back after a container or machine restart). On Vast, pick a free published port so the Swagger UI gets a public link. Protect it with an API key.
 ```bash
 ssh -i ssh/id_ed25519 -p <PORT> <USER@IP> 'cd /workspace/qwen-image-api || exit 1
   if [ ! -f .env ]; then
     P=$(vast-capabilities 2>/dev/null | jq -r "[.instance.open_ports[] | select(.in_use==false and .container_port<65536)][0].container_port // 8000")
     printf "PORT=${P:-8000}\nAPI_KEY=$(openssl rand -hex 16)\n" > .env
   fi
-  cat .env; scripts/start.sh --background'
+  cat .env; scripts/pm2.sh'
 ```
-It ends with `up` and prints the Swagger links.
+It ends with `up` and prints the Swagger links. Check it with `pm2 status`, and read the logs with `pm2 logs qwen-api`. On Vast, run `. /opt/nvm/nvm.sh` first so `pm2` is on PATH.
+
+If the user gave you **R2/S3 bucket credentials**, add them to that `.env` before starting: `R2_ACCESS_KEY_ID`, `R2_SECRET_ACCESS_KEY`, `R2_BUCKET_NAME`, `R2_REGION`, `R2_ENDPOINT` (see `.env.example`). Then run `scripts/pm2.sh` again. `GET /health` shows `"storage": "r2:<bucket>"`. Without credentials, images are saved to `outputs/` and served at `/files/`. Never commit `.env`.
 
 **Step 7: give the user:**
 - The **`Swagger (public)`** link, or, if only `on this machine` was printed, this command: `ssh -i ssh/id_ed25519 -p <PORT> <USER@IP> -L 8000:localhost:8000`, then open http://localhost:8000/docs
 - The **API_KEY** from `.env`. In Swagger they click **Authorize** and paste it.
-- How to use it: **POST /generate → Try it out → edit the prompt → Execute**, and the image appears in the response.
+- How to use it: **POST /generate → Try it out → edit the prompt → Execute**, and the image appears in the response. For apps: `POST /jobs` returns an id, and `GET /jobs/{id}` returns the image `url` when `status` is `done`.
 
 ### If you are already running inside the GPU machine/container
 
@@ -64,7 +66,7 @@ Skip steps 1–3 and run these in the repo folder, in order:
 ```bash
 scripts/install.sh            # 1. venv + deps (creates ComfyUI/models/)
 scripts/download_models.sh    # 2. models (~27 GB), see the table below
-scripts/start.sh --background # 3. backend; prints the Swagger link
+scripts/pm2.sh                # 3. backend under PM2; prints the Swagger link
 ```
 Then give the user the Swagger link it printed. On Vast, set `PORT` in `.env` to a free published port first (see step 6) so you get the public link.
 
@@ -107,17 +109,28 @@ Check it with `GET /health`: every entry under `models` must be `true`. The full
 
 **Swagger UI:** `http://<host>:<port>/docs`. Go to **POST /generate → Try it out → Execute**, and the image is shown in the response.
 
+Every request goes into an in-memory queue, and the GPU works through it one job at a time. Each job gets an id like `20260927-183512-a1b2c3d4`, and that id is also the image's file name in the bucket (`<id>.png`).
+
 ```bash
-curl -X POST http://localhost:8000/generate -H 'X-API-Key: <key>' -H 'Content-Type: application/json' \
-  -d '{"prompt": "a red fox in a snowy forest, a wooden sign reads \"Hello\""}' -o fox.png
+# 1. queue a prompt: returns the id immediately
+curl -X POST http://HOST:PORT/jobs -H 'X-API-Key: <key>' -H 'Content-Type: application/json' \
+  -d '{"prompt": "a red fox in a snowy forest, a wooden sign reads \"Hello\""}'
+# -> {"id": "20260927-183512-a1b2c3d4", "status": "queued", "position": 1, ...}
+
+# 2. check it: when status is "done", url is the signed image link
+curl http://HOST:PORT/jobs/20260927-183512-a1b2c3d4 -H 'X-API-Key: <key>'
+# -> {"id": "...", "status": "done", "url": "https://....r2.cloudflarestorage.com/image/20260927-183512-a1b2c3d4.png?X-Amz-...", ...}
 ```
 
 | Endpoint | Returns |
 |---|---|
-| `POST /generate` | the image (png/jpeg/webp); the seed is in the `X-Seed` header |
-| `POST /generate/json` | `{seed, prompt, elapsed_s, image_base64, …}`; `prompt` is the enhanced one if `enhance` is on |
-| `GET /generate?prompt=...` | the image, for a quick test from a browser |
-| `GET /health` | GPU, free VRAM, and whether each model file is present |
+| `POST /jobs` | queues the prompt and returns `{id, status: "queued", position}` right away (HTTP 202) |
+| `GET /jobs/{id}` | that job: `status` (`queued` → `running` → `done`/`failed`), `position`, `url`, `seed`, timings, `error` |
+| `GET /jobs` | all jobs, newest first, plus counts per status (`?status=done`, `?limit=50`) |
+| `POST /generate` | queues and waits, then returns the image itself (shown in Swagger); headers `X-Job-Id`, `X-Image-Url` |
+| `GET /health` | GPU, free VRAM, queue counts, storage, and whether each model file is present |
+
+The `url` is a signed link, valid for `R2_URL_EXPIRES` seconds (default 7 days, the maximum). A new one is generated every time you call `GET /jobs/{id}`. The queue lives in memory: images stay in the bucket, but the job list starts empty after a restart.
 
 Body fields: `prompt` (required), `width`/`height` (default 1024, 256–2048), `steps` (25), `seed` (random if omitted), `enhance` (false; a Qwen3.5-9B model rewrites the prompt first, adding about 16 s), `format` (`png`/`jpeg`/`webp`), `cfg` (1.0, the official setting), `negative_prompt` (only used when cfg > 1).
 
@@ -129,10 +142,11 @@ Body fields: `prompt` (required), `width`/`height` (default 1024, 256–2048), `
 |---|---|
 | `scripts/install.sh` | clones ComfyUI (pinned commit) and creates `.venv` with torch (cu130/cu128 picked automatically) and all deps |
 | `scripts/download_models.sh` | downloads the models into `ComfyUI/models/`. `SKIP_ENHANCER=1` saves 9.5 GB; `MODEL_SET=bf16` adds the full-precision weights |
-| `scripts/start.sh [--background]` | starts the API, which starts ComfyUI itself. Logs: `logs/api.log`, `logs/comfyui.log` |
-| `scripts/stop.sh` | stops it |
+| `scripts/start.sh [--background]` | starts the API without PM2 (foreground, or detached). The API starts ComfyUI itself. Logs: `logs/`, and ComfyUI logs to `logs/comfyui.log` |
+| `scripts/pm2.sh` | runs the API under PM2: auto-restart on crash, back after reboot (systemd, or supervisor on Vast). Re-run it after changing code or `.env` |
+| `scripts/stop.sh` | stops it (under PM2 it comes back on reboot; `pm2 delete qwen-api && pm2 save` removes it for good) |
 | `scripts/smoke_test.py` | `.venv/bin/python scripts/smoke_test.py http://host:port` |
 
-Settings go in `.env` (see `.env.example`): `PORT`, `API_KEY`, `COMFY_ARGS` (e.g. `--lowvram`), `COMFY_URL` (use an existing ComfyUI instead of starting one), and the model file names.
+Settings go in `.env` (see `.env.example`): `PORT`, `API_KEY`, the `R2_*` bucket settings, `QUEUE_MAX` (default 100 waiting, after which requests get HTTP 429), `COMFY_ARGS` (e.g. `--lowvram`), `COMFY_URL` (use an existing ComfyUI instead of starting one), and the model file names.
 
 > **Note:** on Vast, `/workspace` is only kept if the instance has a volume. Destroying the instance deletes the models, and you have to repeat steps 4–5.

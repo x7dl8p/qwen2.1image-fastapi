@@ -20,6 +20,7 @@ class Settings:
 
     # API
     api_key: str = os.environ.get("API_KEY", "")
+    cors_origins: str = _env("CORS_ORIGINS", "*")        # "*" or comma-separated: https://app.com,http://localhost:3000
     request_timeout: float = float(_env("REQUEST_TIMEOUT", "600"))
     queue_max: int = int(_env("QUEUE_MAX", "100"))       # max jobs waiting; more -> HTTP 429
     jobs_keep: int = int(_env("JOBS_KEEP", "1000"))      # finished jobs remembered when there is no database

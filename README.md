@@ -150,6 +150,6 @@ Body fields: `prompt` (required), `width`/`height` (default 1024, 256–2048), `
 | `scripts/stop.sh` | stops it (under PM2 it comes back on reboot; `pm2 delete qwen-api && pm2 save` removes it for good) |
 | `scripts/smoke_test.py` | `.venv/bin/python scripts/smoke_test.py http://host:port` |
 
-Settings go in `.env` (see `.env.example`): `PORT`, `API_KEY`, the `R2_*` bucket settings, `DATABASE_URL` (in single quotes) and `DB_TABLE`, `QUEUE_MAX` (default 100 waiting, after which requests get HTTP 429), `COMFY_ARGS` (e.g. `--lowvram`), `COMFY_URL` (use an existing ComfyUI instead of starting one), and the model file names.
+Settings go in `.env` (see `.env.example`): `PORT`, `API_KEY`, `CORS_ORIGINS` (default `*`; for production, a comma-separated list like `https://app.com,http://localhost:5173`), the `R2_*` bucket settings, `DATABASE_URL` (in single quotes) and `DB_TABLE`, `QUEUE_MAX` (default 100 waiting, after which requests get HTTP 429), `COMFY_ARGS` (e.g. `--lowvram`), `COMFY_URL` (use an existing ComfyUI instead of starting one), and the model file names.
 
 > **Note:** on Vast, `/workspace` is only kept if the instance has a volume. Destroying the instance deletes the models, and you have to repeat steps 4–5.

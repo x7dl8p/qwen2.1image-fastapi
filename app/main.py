@@ -16,6 +16,7 @@ from datetime import datetime
 from typing import Literal
 
 from fastapi import Depends, FastAPI, HTTPException, Query, Request, Security
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import RedirectResponse, Response
 from fastapi.security import APIKeyHeader
 from fastapi.staticfiles import StaticFiles
@@ -152,6 +153,11 @@ app = FastAPI(title="Qwen-Image 2.1 API", version="3.0", lifespan=lifespan,
                           "If an API key is set, click **Authorize** first.")
 if not storage.is_bucket:
     app.mount("/files", StaticFiles(directory=storage.local_dir), name="files")
+
+# Browsers on other origins may call the API. Auth is the X-API-Key header, not cookies, so no credentials.
+app.add_middleware(CORSMiddleware, allow_origins=[o.strip() for o in settings.cors_origins.split(",") if o.strip()],
+                   allow_methods=["*"], allow_headers=["*"],
+                   expose_headers=["X-Job-Id", "X-Seed", "X-Elapsed-Seconds", "X-Image-Url"])
 
 api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
 

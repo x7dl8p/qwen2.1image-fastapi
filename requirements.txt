@@ -3,3 +3,4 @@ uvicorn[standard]>=0.30
 httpx>=0.27
 huggingface_hub[hf_xet]>=0.30
 boto3>=1.34
+psycopg[binary,pool]>=3.2

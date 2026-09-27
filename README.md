@@ -55,6 +55,8 @@ It ends with `up` and prints the Swagger links. Check it with `pm2 status`, and 
 
 If the user gave you **R2/S3 bucket credentials**, add them to that `.env` before starting: `R2_ACCESS_KEY_ID`, `R2_SECRET_ACCESS_KEY`, `R2_BUCKET_NAME`, `R2_REGION`, `R2_ENDPOINT` (see `.env.example`). Then run `scripts/pm2.sh` again. `GET /health` shows `"storage": "r2:<bucket>"`. Without credentials, images are saved to `outputs/` and served at `/files/`. Never commit `.env`.
 
+If the user gave you a **Postgres URL** (e.g. Neon), add it to `.env` **in single quotes**, because it contains `&`: `DATABASE_URL='postgresql://…?sslmode=require&channel_binding=require'`. Then run `scripts/pm2.sh` again. The table `qwen_images` is created automatically, and `GET /health` shows `"jobs_db": "postgres:qwen_images"`. Without it, the job history is kept in memory only.
+
 **Step 7: give the user:**
 - The **`Swagger (public)`** link, or, if only `on this machine` was printed, this command: `ssh -i ssh/id_ed25519 -p <PORT> <USER@IP> -L 8000:localhost:8000`, then open http://localhost:8000/docs
 - The **API_KEY** from `.env`. In Swagger they click **Authorize** and paste it.
@@ -109,7 +111,7 @@ Check it with `GET /health`: every entry under `models` must be `true`. The full
 
 **Swagger UI:** `http://<host>:<port>/docs`. Go to **POST /generate → Try it out → Execute**, and the image is shown in the response.
 
-Every request goes into an in-memory queue, and the GPU works through it one job at a time. Each job gets an id like `20260927-183512-a1b2c3d4`, and that id is also the image's file name in the bucket (`<id>.png`).
+Every request is a **job**: one row in the Postgres table `qwen_images`, with the prompt, settings, seed, status, timings, file and error. Jobs wait in an in-memory queue, and the GPU works through them one at a time. Each job gets an id like `20260927-183512-a1b2c3d4`, and that id is also the image file name in the bucket (`<id>.png`).
 
 ```bash
 # 1. queue a prompt: returns the id immediately
@@ -126,11 +128,12 @@ curl http://HOST:PORT/jobs/20260927-183512-a1b2c3d4 -H 'X-API-Key: <key>'
 |---|---|
 | `POST /jobs` | queues the prompt and returns `{id, status: "queued", position}` right away (HTTP 202) |
 | `GET /jobs/{id}` | that job: `status` (`queued` → `running` → `done`/`failed`), `position`, `url`, `seed`, timings, `error` |
-| `GET /jobs` | all jobs, newest first, plus counts per status (`?status=done`, `?limit=50`) |
+| `GET /jobs` | jobs, newest first: `{total, counts, limit, offset, jobs}`. Query: `?status=done`, `?limit=50` (max 500), `?offset=50` |
+| `DELETE /jobs/{id}` | deletes a finished job: its row and its image in the bucket (409 while it is still queued or running) |
 | `POST /generate` | queues and waits, then returns the image itself (shown in Swagger); headers `X-Job-Id`, `X-Image-Url` |
 | `GET /health` | GPU, free VRAM, queue counts, storage, and whether each model file is present |
 
-The `url` is a signed link, valid for `R2_URL_EXPIRES` seconds (default 7 days, the maximum). A new one is generated every time you call `GET /jobs/{id}`. The queue lives in memory: images stay in the bucket, but the job list starts empty after a restart.
+The `url` is a signed link, valid for `R2_URL_EXPIRES` seconds (default 7 days, the maximum). A new one is generated every time you call `GET /jobs/{id}`. Job history is kept in Postgres, so it survives restarts. Jobs that were queued or running during a restart are queued again automatically, with the same ids.
 
 Body fields: `prompt` (required), `width`/`height` (default 1024, 256–2048), `steps` (25), `seed` (random if omitted), `enhance` (false; a Qwen3.5-9B model rewrites the prompt first, adding about 16 s), `format` (`png`/`jpeg`/`webp`), `cfg` (1.0, the official setting), `negative_prompt` (only used when cfg > 1).
 
@@ -147,6 +150,6 @@ Body fields: `prompt` (required), `width`/`height` (default 1024, 256–2048), `
 | `scripts/stop.sh` | stops it (under PM2 it comes back on reboot; `pm2 delete qwen-api && pm2 save` removes it for good) |
 | `scripts/smoke_test.py` | `.venv/bin/python scripts/smoke_test.py http://host:port` |
 
-Settings go in `.env` (see `.env.example`): `PORT`, `API_KEY`, the `R2_*` bucket settings, `QUEUE_MAX` (default 100 waiting, after which requests get HTTP 429), `COMFY_ARGS` (e.g. `--lowvram`), `COMFY_URL` (use an existing ComfyUI instead of starting one), and the model file names.
+Settings go in `.env` (see `.env.example`): `PORT`, `API_KEY`, the `R2_*` bucket settings, `DATABASE_URL` (in single quotes) and `DB_TABLE`, `QUEUE_MAX` (default 100 waiting, after which requests get HTTP 429), `COMFY_ARGS` (e.g. `--lowvram`), `COMFY_URL` (use an existing ComfyUI instead of starting one), and the model file names.
 
 > **Note:** on Vast, `/workspace` is only kept if the instance has a volume. Destroying the instance deletes the models, and you have to repeat steps 4–5.

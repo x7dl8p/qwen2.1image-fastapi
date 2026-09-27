@@ -22,7 +22,11 @@ class Settings:
     api_key: str = os.environ.get("API_KEY", "")
     request_timeout: float = float(_env("REQUEST_TIMEOUT", "600"))
     queue_max: int = int(_env("QUEUE_MAX", "100"))       # max jobs waiting; more -> HTTP 429
-    jobs_keep: int = int(_env("JOBS_KEEP", "1000"))      # finished jobs remembered in memory
+    jobs_keep: int = int(_env("JOBS_KEEP", "1000"))      # finished jobs remembered when there is no database
+
+    # Job history: Postgres (e.g. Neon). Unset -> kept in memory only.
+    database_url: str = os.environ.get("DATABASE_URL", "")
+    db_table: str = _env("DB_TABLE", "qwen_images")
 
     # Storage: Cloudflare R2 (any S3-compatible bucket). Unset -> images saved to ./outputs.
     r2_access_key_id: str = os.environ.get("R2_ACCESS_KEY_ID", "")

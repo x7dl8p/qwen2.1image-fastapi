@@ -1,9 +1,10 @@
-"""Qwen-Image 2.1 text-to-image API.
+"""Qwen-Image 2.1 text-to-image API. Every image is a job, stored as one row in Postgres.
 
-POST /jobs          queue a prompt -> job id right away (the id is also the image file name)
-GET  /jobs/{id}     status of one job + signed image URL when done
-GET  /jobs          all jobs + queue counts
-POST /generate      queue and wait -> the image itself (handy in Swagger)
+POST   /jobs        queue a prompt -> job id right away (the id is also the image file name)
+GET    /jobs/{id}   one job + signed image URL when done
+GET    /jobs        list (status filter, limit/offset)
+DELETE /jobs/{id}   delete a finished job and its image
+POST   /generate    queue and wait -> the image itself (handy in Swagger)
 """
 import io
 import logging
@@ -11,9 +12,10 @@ import random
 import secrets
 import time
 from contextlib import asynccontextmanager
+from datetime import datetime
 from typing import Literal
 
-from fastapi import Depends, FastAPI, HTTPException, Request, Security
+from fastapi import Depends, FastAPI, HTTPException, Query, Request, Security
 from fastapi.responses import RedirectResponse, Response
 from fastapi.security import APIKeyHeader
 from fastapi.staticfiles import StaticFiles
@@ -23,6 +25,7 @@ from pydantic import BaseModel, Field, field_validator
 from . import workflow
 from .comfy import ComfyEngine
 from .config import settings
+from .db import make_store
 from .jobs import Job, JobQueue, QueueFull
 from .storage import Storage
 
@@ -44,6 +47,11 @@ class GenerateRequest(BaseModel):
     enhance: bool = Field(False, description="rewrite the prompt with the Qwen3.5-9B prompt enhancer first (~+16 s)")
     format: Literal["png", "jpeg", "webp"] = "png"
 
+    # Swagger's pre-filled body: no seed, so each run gets a random one.
+    model_config = {"json_schema_extra": {"examples": [{
+        "prompt": 'A red fox in a snowy birch forest at golden hour, a wooden sign reads "Hello"',
+        "width": 1024, "height": 1024, "steps": 25, "enhance": False, "format": "png"}]}}
+
     @field_validator("width", "height")
     @classmethod
     def multiple_of_16(cls, v: int) -> int:
@@ -58,19 +66,26 @@ class JobOut(BaseModel):
     file: str | None = None
     prompt: str
     enhanced_prompt: str | None = None
+    negative_prompt: str = ""
     width: int
     height: int
     steps: int
+    cfg: float
     seed: int | None = None
-    created_at: str
-    started_at: str | None = None
-    finished_at: str | None = None
+    enhance: bool
+    format: str
+    created_at: datetime
+    started_at: datetime | None = None
+    finished_at: datetime | None = None
     elapsed_s: float | None = Field(None, description="generation time")
     error: str | None = None
 
 
 class JobList(BaseModel):
-    counts: dict[str, int]
+    total: int = Field(description="jobs matching the filter")
+    counts: dict[str, int] = Field(description="all jobs per status")
+    limit: int
+    offset: int
     jobs: list[JobOut] = Field(description="newest first")
 
 
@@ -98,7 +113,17 @@ async def run_job(job: Job) -> None:
              job.id, req.width, req.height, req.steps, job.seed, req.enhance, job.elapsed_s, name)
 
 
-queue = JobQueue(run_job, max_queued=settings.queue_max, keep=settings.jobs_keep)
+store = make_store(settings)
+queue = JobQueue(run_job, store, max_queued=settings.queue_max)
+
+
+async def requeue_unfinished() -> None:
+    """Jobs that were queued/running when the server stopped are queued again, keeping their ids."""
+    for row in await store.unfinished():
+        req = GenerateRequest(**{k: row[k] for k in ("prompt", "negative_prompt", "width", "height", "steps",
+                                                     "cfg", "seed", "enhance", "format")})
+        await queue.submit(req, job_id=row["id"], created_at=row["created_at"])
+        log.info("job %s re-queued after restart", row["id"])
 
 
 @asynccontextmanager
@@ -106,18 +131,23 @@ async def lifespan(_: FastAPI):
     missing = [f"{k}: {p}" for k, p in settings.model_paths().items() if not p.exists() and not settings.comfy_url]
     if missing:
         log.warning("model files missing (run scripts/download_models.sh):\n  %s", "\n  ".join(missing))
+    await store.open()
     await engine.start()
+    await requeue_unfinished()
     queue.start()
     yield
     await queue.stop()
     await engine.stop()
+    await store.close()
 
 
-app = FastAPI(title="Qwen-Image 2.1 API", version="2.0", lifespan=lifespan,
-              description="Text-to-image with Qwen-Image 2.1.\n\n"
+app = FastAPI(title="Qwen-Image 2.1 API", version="3.0", lifespan=lifespan,
+              description="Text-to-image with Qwen-Image 2.1. Every image is a **job**, stored as one row in "
+                          "Postgres; the job id is also the image file name in the bucket.\n\n"
                           "* **POST /jobs** queues a prompt and returns its id immediately; "
                           "poll **GET /jobs/{id}** until `status` is `done` and open `url`.\n"
-                          "* **POST /generate** does the same but waits and returns the image "
+                          "* **GET /jobs** lists them (filter + paging), **DELETE /jobs/{id}** removes one.\n"
+                          "* **POST /generate** queues, waits and returns the image "
                           "(Try it out → Execute shows it here).\n\n"
                           "If an API key is set, click **Authorize** first.")
 if not storage.is_bucket:
@@ -131,23 +161,27 @@ def require_key(key: str | None = Security(api_key_header)) -> None:
         raise HTTPException(401, "invalid or missing API key (X-API-Key header)")
 
 
-def job_out(job: Job, request: Request) -> JobOut:
-    r: GenerateRequest = job.request
+def job_out(row: dict, request: Request) -> JobOut:
     url = None
-    if job.file:
-        url = storage.url(job.file)
+    if row.get("file"):
+        url = storage.url(row["file"])
         if url.startswith("/"):
             url = str(request.base_url).rstrip("/") + url
-    return JobOut(id=job.id, status=job.status, position=queue.position(job), url=url, file=job.file,
-                  prompt=r.prompt, enhanced_prompt=job.prompt_used if r.enhance else None,
-                  width=r.width, height=r.height, steps=r.steps, seed=job.seed,
-                  created_at=job.created_at, started_at=job.started_at, finished_at=job.finished_at,
-                  elapsed_s=job.elapsed_s, error=job.error)
+    return JobOut(**{k: v for k, v in row.items() if k in JobOut.model_fields},
+                  url=url, position=queue.position(row["id"]))
 
 
-def submit(req: GenerateRequest, keep_data: bool = False) -> Job:
+async def load_row(job_id: str) -> dict:
+    job = queue.active.get(job_id)  # in-flight jobs: freshest state is in memory
+    row = job.to_row() if job else await store.get(job_id)
+    if not row:
+        raise HTTPException(404, f"job {job_id} not found")
+    return row
+
+
+async def submit(req: GenerateRequest, keep_data: bool = False) -> Job:
     try:
-        return queue.submit(req, keep_data=keep_data)
+        return await queue.submit(req, keep_data=keep_data)
     except QueueFull as e:
         raise HTTPException(429, str(e))
 
@@ -162,32 +196,46 @@ async def health():
     if not await engine.alive():
         raise HTTPException(503, "ComfyUI not reachable")
     dev = (await engine.system_stats())["devices"][0]
+    running = sum(j.status == "running" for j in queue.active.values())
     return {"status": "ok", "gpu": dev["name"], "vram_total_gb": round(dev["vram_total"] / 2**30, 1),
-            "vram_free_gb": round(dev["vram_free"] / 2**30, 1), "queue": queue.counts(),
+            "vram_free_gb": round(dev["vram_free"] / 2**30, 1),
+            "queue": {"waiting": len(queue.active) - running, "running": running},
             "storage": f"r2:{settings.r2_bucket}" if storage.is_bucket else "local:outputs/",
+            "jobs_db": f"postgres:{settings.db_table}" if settings.database_url else "memory",
             "models": {k: p.exists() for k, p in settings.model_paths().items()}}
 
 
 @app.post("/jobs", response_model=JobOut, status_code=202, dependencies=[Depends(require_key)],
           summary="Queue a prompt, get the job id back immediately")
 async def create_job(req: GenerateRequest, request: Request):
-    return job_out(submit(req), request)
+    return job_out((await submit(req)).to_row(), request)
+
+
+@app.get("/jobs", response_model=JobList, dependencies=[Depends(require_key)],
+         summary="List jobs, newest first (filter by status, page with limit/offset)")
+async def list_jobs(request: Request, status: Literal["queued", "running", "done", "failed"] | None = None,
+                    limit: int = Query(50, ge=1, le=500), offset: int = Query(0, ge=0)):
+    rows, total = await store.list(status, limit, offset)
+    return JobList(total=total, counts=await store.counts(), limit=limit, offset=offset,
+                   jobs=[job_out(r, request) for r in rows])
 
 
 @app.get("/jobs/{job_id}", response_model=JobOut, dependencies=[Depends(require_key)],
          summary="One job: status, and the image URL once done")
 async def get_job(job_id: str, request: Request):
-    job = queue.get(job_id)
-    if not job:
-        raise HTTPException(404, f"job {job_id} not found")
-    return job_out(job, request)
+    return job_out(await load_row(job_id), request)
 
 
-@app.get("/jobs", response_model=JobList, dependencies=[Depends(require_key)], summary="All jobs, newest first")
-async def list_jobs(request: Request, status: Literal["queued", "running", "done", "failed"] | None = None,
-                    limit: int = 100):
-    jobs = [j for j in reversed(queue.jobs.values()) if status is None or j.status == status][:limit]
-    return JobList(counts=queue.counts(), jobs=[job_out(j, request) for j in jobs])
+@app.delete("/jobs/{job_id}", dependencies=[Depends(require_key)],
+            summary="Delete a finished job: its row and its image in the bucket")
+async def delete_job(job_id: str):
+    if job_id in queue.active:
+        raise HTTPException(409, "job is still queued or running")
+    row = await load_row(job_id)
+    if row.get("file"):
+        await storage.delete(row["file"])
+    await store.delete(job_id)
+    return {"deleted": job_id}
 
 
 @app.post("/generate", response_class=Response, dependencies=[Depends(require_key)],
@@ -195,12 +243,12 @@ async def list_jobs(request: Request, status: Literal["queued", "running", "done
                            "content": {"image/png": {}, "image/jpeg": {}, "image/webp": {}}}},
           summary="Queue a prompt and wait: returns the image itself")
 async def generate(req: GenerateRequest, request: Request):
-    job = submit(req, keep_data=True)
+    job = await submit(req, keep_data=True)
     await job.done.wait()
     data, job.data = job.data, None
     if job.status == "failed" or data is None:
         raise HTTPException(500, job.error or "generation failed")
-    out = job_out(job, request)
+    out = job_out(job.to_row(), request)
     return Response(data, media_type=f"image/{req.format}",
                     headers={"X-Job-Id": job.id, "X-Seed": str(job.seed), "X-Elapsed-Seconds": str(job.elapsed_s),
                              "X-Image-Url": out.url or ""})

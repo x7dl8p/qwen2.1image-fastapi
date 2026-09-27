@@ -39,6 +39,12 @@ class Storage:
         else:
             await asyncio.to_thread((self.local_dir / name).write_bytes, data)
 
+    async def delete(self, name: str) -> None:
+        if self.client:
+            await asyncio.to_thread(self.client.delete_object, Bucket=self.s.r2_bucket, Key=self.key(name))
+        else:
+            (self.local_dir / name).unlink(missing_ok=True)
+
     def url(self, name: str) -> str:
         """Bucket: signed GET URL (fresh on every call). Local: path under /files/ (made absolute by the API)."""
         if not self.client:
